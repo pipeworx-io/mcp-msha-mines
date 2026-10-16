@@ -5,7 +5,7 @@ for its status, recent inspections, violations (with assessed penalties),
 and quarterly employment/production — from MSHA (Mine Safety and Health
 Administration) records.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1745+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1819+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -21,6 +21,19 @@ Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents 
   penalties, S&S flag, and abatement/termination dates), and recent
   quarterly employment and coal production summed across subunits. A Mine ID
   with no match returns `found: false` with `data_as_of` — not an error.
+- `msha_violation_counts(mine_id?, mine_name?, year?, year_from?, year_to?)` —
+  count a mine's violations within a calendar year or year range in ONE
+  call, with a total plus a breakdown by who it was issued to (Operator,
+  Contractor, Agent, Miner) and by significant-and-substantial (S&S) status.
+  `msha_mine_detail`'s `violations` list is capped at `violations_limit`
+  (max 100) and carries no true count — this is the tool for "how many
+  violations did mine X get in year Y". Counted by the calendar year of each
+  violation's own issue date (`VIOLATION_ISSUE_DT`, via MSHA's own `CAL_YR`
+  field). Accepts a Mine ID directly, or a mine/operator/controller name
+  that resolves to exactly one mine (ambiguous or no-match names come back
+  as a named error listing the candidates). A year outside the loaded
+  5-year window is flagged in `coverage` as not loaded, never answered as a
+  silent zero.
 
 ## Auth
 
@@ -145,7 +158,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1745+ data sources. The
+Both URLs reach the same gateway and the same 1819+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

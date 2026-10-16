@@ -673,7 +673,10 @@ function collapse(s: string): string {
 /**
  * MSHA mine records — search a US mine by operator or mine name, or look up
  * a known MSHA Mine ID for its status, recent inspections, violations (with
- * assessed penalties) and employment/production (fleet #2822).
+ * assessed penalties) and employment/production (fleet #2822). Also counts a
+ * mine's violations by calendar year/range, broken down by violator type and
+ * S&S, in one call (msha_violation_counts, fleet #3181) — msha_mine_detail's
+ * violations list is capped at violations_limit and carries no true count.
  *
  * SOURCE. MSHA's Mine Data Retrieval System (msha.gov/mdrs) is a
  * MicroStrategy BI application embedded in an <iframe>, not a JSON endpoint
@@ -721,6 +724,30 @@ async function pg(args: Record<string, unknown>, path: string): Promise<any[]> {
   return parseJson<any[]>(res, 'MSHA mine records backing store');
 }
 
+/**
+ * Exact row count for a filtered query, via PostgREST's `Prefer: count=exact`
+ * + `Content-Range` response header rather than fetching (and counting)
+ * rows — same pattern as mcps/gao-protests/src/index.ts's pgCount. `limit=1`
+ * keeps the response body itself tiny; the header carries the real total
+ * regardless of how many rows would otherwise match (fleet #3181 — this
+ * pack had no way to COUNT a mine's violations, only list a bounded recent
+ * window of them).
+ */
+async function pgCount(args: Record<string, unknown>, path: string): Promise<number> {
+  const url = (args._supabaseUrl as string | undefined)?.trim();
+  const key = (args._supabaseKey as string | undefined)?.trim();
+  if (!url || !key) throw new Error('backing-store credentials not injected');
+  const res = await pwFetch(`${url}/rest/v1/${path}&limit=1`, {
+    headers: { apikey: key, Authorization: `Bearer ${key}`, Accept: 'application/json', Prefer: 'count=exact' },
+  });
+  if (!res.ok) throw await httpError(res, 'MSHA mine records backing store');
+  const range = res.headers.get('content-range') ?? '';
+  const total = range.split('/')[1];
+  const n = Number(total);
+  if (!Number.isFinite(n)) throw new Error(`count_unavailable: backing store did not return a Content-Range total for ${path}`);
+  return n;
+}
+
 function esc(v: string): string {
   return encodeURIComponent(v);
 }
@@ -744,6 +771,15 @@ function str(v: unknown): string | null {
  * such mine" when the real condition is "our weekly refresh hasn't completed
  * yet" — a silent-zero wrong negative. Throws LOUDLY instead.
  */
+/** The calendar-year window scripts/ingest-msha-mines.mjs currently keeps
+ *  loaded for msha_violations/msha_inspections (recomputed from "now", same
+ *  as the ingest script's own CUTOFF_YEAR) — so a count tool can say
+ *  honestly which years of a request it can actually answer for. */
+function loadedYearWindow(): { from: number; to: number } {
+  const to = new Date().getUTCFullYear();
+  return { from: to - RECENT_YEARS_BOUND + 1, to };
+}
+
 async function assertLoaded(args: Record<string, unknown>): Promise<string> {
   const rows = await pg(args, 'msha_mines?select=loaded_at&limit=1');
   if (rows.length === 0 || !rows[0]?.loaded_at) {
@@ -786,6 +822,22 @@ const tools: McpToolExport['tools'] = [
         inspections_limit: { type: 'number', description: 'Max recent inspections to return (default 10, max 50).' },
       },
       required: ['mine_id'],
+    },
+  },
+  {
+    name: 'msha_violation_counts',
+    description:
+      'Count MSHA violations issued at one mine within a calendar year or year range — in ONE call, not a listing. Returns the TOTAL plus a breakdown by who it was issued to (Operator vs Contractor vs Agent vs Miner) and by significant-and-substantial (S&S) status. Use this instead of msha_mine_detail when the question is "how many" — msha_mine_detail only returns its most recent violations_limit rows (default 20, max 100) and has no true count. Counted by the calendar year of each violation\'s own issue date (VIOLATION_ISSUE_DT, via MSHA\'s own CAL_YR field). Only the most recent 5 calendar years are loaded (the response\'s `coverage` field says exactly which); a year outside that window comes back flagged as "not loaded," never as a silent zero. Takes a known MSHA Mine ID (use msha_mine_search to find one) or a mine/operator/controller name — the name path only works when it resolves to exactly one mine; otherwise it lists the candidates so you can retry with a mine_id. Sourced from MSHA\'s own bulk mine-records files (public domain), refreshed weekly. Keyless.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        mine_id: { type: 'string', description: 'MSHA Mine ID, e.g. "4601437". Preferred over mine_name — unambiguous.' },
+        mine_name: { type: 'string', description: 'Mine, operator, or controller name to resolve to a Mine ID — used only when mine_id is omitted, and only works if it matches exactly one mine.' },
+        year: { type: 'number', description: 'Single calendar year to count, e.g. 2025.' },
+        year_from: { type: 'number', description: 'First calendar year of a range (inclusive). Use together with year_to instead of year.' },
+        year_to: { type: 'number', description: 'Last calendar year of a range (inclusive). Use together with year_from instead of year.' },
+      },
+      required: [],
     },
   },
 ];
@@ -938,12 +990,118 @@ async function mshaMineDetail(args: Record<string, unknown>): Promise<unknown> {
   };
 }
 
+/** Resolves mine_id (verified to exist) or mine_name (must match exactly one
+ *  mine) to a single {mineId, mineName}. Throws a NAMED error either way on
+ *  a lookup failure — never a silent empty result — per fleet #3181. */
+async function resolveMine(
+  args: Record<string, unknown>,
+  mineIdInput: string | null,
+  mineNameInput: string | null,
+): Promise<{ mineId: string; mineName: string | null }> {
+  if (mineIdInput) {
+    const rows = await pg(args, `msha_mines?mine_id=eq.${esc(mineIdInput)}&select=mine_id,mine_name&limit=1`);
+    if (rows.length === 0) {
+      throw new Error(`mine_not_found: Mine ID "${mineIdInput}" is not in MSHA's mine records as of the last weekly refresh.`);
+    }
+    return { mineId: rows[0].mine_id, mineName: rows[0].mine_name ?? null };
+  }
+  const name = mineNameInput as string;
+  const q = esc(`*${name.toLowerCase()}*`);
+  const rows = await pg(
+    args,
+    `msha_mines?or=(mine_name.ilike.${q},operator_name.ilike.${q},controller_name.ilike.${q})&select=mine_id,mine_name&limit=5`,
+  );
+  if (rows.length === 0) {
+    throw new Error(`mine_not_found: No mine, operator, or controller name matched "${name}". Try msha_mine_search for candidates, then pass a mine_id.`);
+  }
+  if (rows.length > 1) {
+    const candidates = rows.map((r) => `${r.mine_id} (${r.mine_name})`).join(', ');
+    throw new Error(
+      `ambiguous_mine_name: "${name}" matched ${rows.length}${rows.length === 5 ? '+' : ''} mines — ${candidates}. Call msha_mine_search to pick one, then pass its mine_id here.`,
+    );
+  }
+  return { mineId: rows[0].mine_id, mineName: rows[0].mine_name ?? null };
+}
+
+async function mshaViolationCounts(args: Record<string, unknown>): Promise<unknown> {
+  const mineIdInput = str(args.mine_id);
+  const mineNameInput = str(args.mine_name);
+  if (!mineIdInput && !mineNameInput) throw new Error('mine_id or mine_name is required');
+
+  const year = num(args.year);
+  const yearFrom = num(args.year_from);
+  const yearTo = num(args.year_to);
+  let lo: number;
+  let hi: number;
+  if (year != null) {
+    lo = hi = year;
+  } else if (yearFrom != null && yearTo != null) {
+    lo = Math.min(yearFrom, yearTo);
+    hi = Math.max(yearFrom, yearTo);
+  } else {
+    throw new Error('year, or both year_from and year_to, is required');
+  }
+
+  const loadedAt = await assertLoaded(args);
+  const { mineId, mineName } = await resolveMine(args, mineIdInput, mineNameInput);
+
+  const window = loadedYearWindow();
+  const requestedYears = { from: lo, to: hi };
+  const outOfWindow = hi < window.from || lo > window.to;
+  const partiallyOutOfWindow = !outOfWindow && (lo < window.from || hi > window.to);
+
+  const yearFilter = lo === hi ? `cal_yr=eq.${lo}` : `cal_yr=gte.${lo}&cal_yr=lte.${hi}`;
+  const base = `msha_violations?mine_id=eq.${esc(mineId)}&${yearFilter}`;
+
+  const [total, operator, contractor, agent, miner, sigSubYes, sigSubNo] = outOfWindow
+    ? [0, 0, 0, 0, 0, 0, 0]
+    : await Promise.all([
+        pgCount(args, `${base}&select=id`),
+        pgCount(args, `${base}&violator_type_cd=eq.Operator&select=id`),
+        pgCount(args, `${base}&violator_type_cd=eq.Contractor&select=id`),
+        pgCount(args, `${base}&violator_type_cd=eq.Agent&select=id`),
+        pgCount(args, `${base}&violator_type_cd=eq.Miner&select=id`),
+        pgCount(args, `${base}&sig_sub=eq.Y&select=id`),
+        pgCount(args, `${base}&sig_sub=eq.N&select=id`),
+      ]);
+  const otherViolatorType = Math.max(0, total - operator - contractor - agent - miner);
+  const sigSubNotRecorded = Math.max(0, total - sigSubYes - sigSubNo);
+
+  let coverage: string;
+  if (outOfWindow) {
+    coverage = `Requested year(s) ${lo === hi ? lo : `${lo}-${hi}`} are entirely outside the loaded window (only calendar years ${window.from}-${window.to} are held) — this total is NOT a real zero, it means that period is not loaded here.`;
+  } else if (partiallyOutOfWindow) {
+    coverage = `Requested year(s) ${lo === hi ? lo : `${lo}-${hi}`} partially fall outside the loaded window (only calendar years ${window.from}-${window.to} are held) — the count below covers only the overlap with ${window.from}-${window.to}, not the full requested range.`;
+  } else {
+    coverage = `Calendar years ${window.from}-${window.to} are loaded; the requested year(s) ${lo === hi ? lo : `${lo}-${hi}`} are fully within that window.`;
+  }
+
+  return {
+    mine_id: mineId,
+    mine_name: mineName,
+    requested_years: requestedYears,
+    date_field: "violation_issue_dt, counted by its calendar year (MSHA's CAL_YR field)",
+    coverage,
+    total_violations: total,
+    by_violator_type: { operator, contractor, agent, miner, other: otherViolatorType },
+    significant_and_substantial: { yes: sigSubYes, no: sigSubNo, not_recorded: sigSubNotRecorded },
+    data_as_of: loadedAt,
+    source: UPSTREAM,
+    note:
+      total === 0 && !outOfWindow
+        ? `No violations recorded for mine ${mineId} in ${lo === hi ? lo : `${lo}-${hi}`} within the loaded window (calendar years ${window.from}-${window.to}).`
+        : undefined,
+  };
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   switch (name) {
     case 'msha_mine_search':
       return mshaMineSearch(args);
     case 'msha_mine_detail':
       return mshaMineDetail(args);
+    case 'msha_violation_counts':
+      return mshaViolationCounts(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
