@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-msha-mines",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MSHA mine records — search a US mine by operator or mine name, or look up a known MSHA Mine ID for its status, recent inspections, violations (with assessed penalties) and employment/production (fleet #2822).",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-807be4114fd053bcdcbd77ae0bf5b73b8dd52adb4ac7e309f47aef3377b06b92",
-    "sourceCommit": "a03f96ed672b8c149593c64ecbf30280cabf084c"
+    "sourceHash": "v1-e85b692c3ec87e58a8d67f1a1d3a1bed7608a3813bec2ddfbaf7a969aa0c004b",
+    "sourceCommit": "774de7f685a75e02d0b828d24a7b94794102152c"
   }
 }
