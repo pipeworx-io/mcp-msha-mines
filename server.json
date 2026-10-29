@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/msha-mines",
   "title": "Msha Mines",
   "description": "MSHA mine records — search a US mine by operator or mine name, or look up a known MSHA Mine ID for…",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/msha-mines",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-msha-mines",
